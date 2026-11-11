@@ -1,4 +1,4 @@
-from app.models.entities import AdminUser, Base, Bid, Loan, Product, PublicInquiry, Referral, SettingsRecord
+from app.models.entities import AdminAuditLog, AdminUser, Base, Bid, Loan, Product, PublicInquiry, Referral, SettingsRecord
 from app.models.portfolio import (
     PortfolioCapitalEntry,
     PortfolioCoupon,
@@ -10,6 +10,7 @@ from app.models.portfolio import (
 
 __all__ = [
     "AdminUser",
+    "AdminAuditLog",
     "Base",
     "Bid",
     "Loan",

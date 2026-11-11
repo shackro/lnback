@@ -39,6 +39,18 @@ def ensure_portfolio_audit_columns(bind: Engine) -> None:
         )
 
 
+def ensure_admin_security_columns(bind: Engine) -> None:
+    columns = {column["name"] for column in inspect(bind).get_columns("admin_users")}
+    missing_columns = {"permissions", "token_version"} - columns
+    if not missing_columns:
+        return
+    with bind.begin() as connection:
+        if "permissions" in missing_columns:
+            connection.execute(text("ALTER TABLE admin_users ADD COLUMN permissions JSON NOT NULL DEFAULT '[]'"))
+        if "token_version" in missing_columns:
+            connection.execute(text("ALTER TABLE admin_users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"))
+
+
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:

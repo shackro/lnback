@@ -1,9 +1,11 @@
 import typer
 
 from app.core.config import settings
+from app.core.dependencies import ADMIN_PERMISSIONS
 from app.core.security import get_password_hash
-from app.db.session import SessionLocal, engine
+from app.db.session import SessionLocal, engine, ensure_admin_security_columns
 from app.models import AdminUser, Base
+from app.services.admin_access import record_admin_event
 
 cli = typer.Typer()
 
@@ -16,12 +18,29 @@ def create_admin(email: str, password: str) -> None:
         raise typer.BadParameter("Password must be between 12 and 256 characters.")
 
     Base.metadata.create_all(bind=engine)
+    ensure_admin_security_columns(engine)
     with SessionLocal() as db:
-        if db.query(AdminUser).filter(AdminUser.email == email).first() is not None:
-            raise typer.BadParameter("An admin with that email already exists.", param_hint="--email")
-        db.add(AdminUser(email=email, hashed_password=get_password_hash(password), role="admin"))
+        if db.query(AdminUser).first() is not None:
+            raise typer.BadParameter(
+                "Initial super administrator already exists. Create additional admins from the admin control room.",
+                param_hint="--email",
+            )
+        admin = AdminUser(
+            email=email,
+            hashed_password=get_password_hash(password),
+            role="super_admin",
+            permissions=sorted(ADMIN_PERMISSIONS),
+        )
+        db.add(admin)
+        record_admin_event(
+            db,
+            actor_email="system.bootstrap",
+            action="genesis_super_admin_created",
+            target_admin_email=email,
+            details={"permissions": admin.permissions},
+        )
         db.commit()
-    typer.echo(f"Admin account created for {email}.")
+    typer.echo(f"Initial super administrator created for {email}.")
 
 
 def require_secret_key() -> None:

@@ -277,6 +277,88 @@ class InquiryStatusRequest(ApiModel):
     status: Literal["new", "contacted", "closed"]
 
 
+AdminPermission = Literal[
+    "dashboard.read",
+    "inventory.manage",
+    "holds.manage",
+    "loans.manage",
+    "inquiries.manage",
+    "payouts.manage",
+    "portfolio.manage",
+    "settings.manage",
+]
+
+
+class AdminCreateRequest(ApiModel):
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=12, max_length=256)
+    permissions: list[AdminPermission] = Field(default_factory=lambda: ["dashboard.read"])
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
+            raise ValueError("Enter a valid email address")
+        return normalized
+
+    @field_validator("permissions")
+    @classmethod
+    def validate_permissions(cls, value: list[AdminPermission]) -> list[AdminPermission]:
+        if "dashboard.read" not in value:
+            raise ValueError("The dashboard.read permission is required")
+        if len(set(value)) != len(value):
+            raise ValueError("Permissions cannot contain duplicates")
+        return value
+
+
+class AdminPermissionUpdateRequest(ApiModel):
+    permissions: list[AdminPermission]
+
+    @field_validator("permissions")
+    @classmethod
+    def validate_permissions(cls, value: list[AdminPermission]) -> list[AdminPermission]:
+        if "dashboard.read" not in value:
+            raise ValueError("The dashboard.read permission is required")
+        if len(set(value)) != len(value):
+            raise ValueError("Permissions cannot contain duplicates")
+        return value
+
+
+class AdminPasswordChangeRequest(ApiModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+    @field_validator("new_password")
+    @classmethod
+    def require_new_password(cls, value: str, info: ValidationInfo) -> str:
+        if value == info.data.get("current_password"):
+            raise ValueError("Choose a password different from the current password")
+        return value
+
+
+class AdminUserSchema(ApiModel):
+    id: int
+    email: str
+    role: Literal["admin", "super_admin"]
+    permissions: list[str]
+
+
+class AdminAuditSchema(ApiModel):
+    id: int
+    actor_email: str
+    action: str
+    target_admin_email: str
+    details: dict[str, object]
+    created_at: datetime
+
+
+class AdminMeSchema(ApiModel):
+    email: str
+    role: Literal["admin", "super_admin"]
+    permissions: list[str]
+
+
 class StoreSchema(ApiModel):
     products: list[ProductSchema]
     bids: list[BidSchema]

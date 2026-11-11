@@ -26,7 +26,11 @@ def get_password_hash(password: str) -> str:
     return password_hash.hash(password)
 
 
-def create_access_token(email: str) -> str:
+def create_access_token(email: str, role: str = "admin", token_version: int = 0) -> str:
     secret_key = require_secret_key()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.admin_token_expire_minutes)
-    return jwt.encode({"sub": email, "role": "admin", "exp": expires_at}, secret_key, algorithm="HS256")
+    return jwt.encode(
+        {"sub": email, "role": role, "ver": token_version, "exp": expires_at},
+        secret_key,
+        algorithm="HS256",
+    )

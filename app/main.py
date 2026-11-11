@@ -11,20 +11,27 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.dependencies import require_admin
-from app.core.security import create_access_token, require_secret_key, verify_password
+from app.core.dependencies import require_admin, require_permission, require_super_admin
+from app.core.security import create_access_token, get_password_hash, require_secret_key, verify_password
 from app.db.session import (
     SessionLocal,
     engine,
+    ensure_admin_security_columns,
     ensure_portfolio_audit_columns,
     ensure_product_media_columns,
     get_db,
 )
-from app.models import AdminUser, Base, Bid, Loan, PortfolioLoan, Product, PublicInquiry, Referral, SettingsRecord
+from app.models import AdminAuditLog, AdminUser, Base, Bid, Loan, PortfolioLoan, Product, PublicInquiry, Referral, SettingsRecord
 from app.routers.portfolio import router as portfolio_router, system_router as portfolio_system_router
 from app.schemas import (
-    BidResolveRequest,
+    AdminAuditSchema,
+    AdminCreateRequest,
+    AdminMeSchema,
+    AdminPasswordChangeRequest,
+    AdminPermissionUpdateRequest,
+    AdminUserSchema,
     BidCreateRequest,
+    BidResolveRequest,
     BidSchema,
     AssetFinanceInquiryRequest,
     InquirySchema,
@@ -43,15 +50,18 @@ from app.schemas import (
     StoreSchema,
 )
 from app.seed import seed_database
+from app.services.admin_access import promote_genesis_admin, record_admin_event
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    ensure_admin_security_columns(engine)
     ensure_product_media_columns(engine)
     ensure_portfolio_audit_columns(engine)
     with SessionLocal() as db:
         seed_database(db)
+        promote_genesis_admin(db)
     yield
 
 
@@ -78,14 +88,20 @@ def admin_login(
 ) -> dict[str, str]:
     require_secret_key()
     email = form_data.username.strip().lower()
-    admin = db.query(AdminUser).filter(AdminUser.email == email, AdminUser.role == "admin").first()
+    admin = db.query(AdminUser).filter(
+        AdminUser.email == email,
+        AdminUser.role.in_(("admin", "super_admin")),
+    ).first()
     if admin is None or len(form_data.password) > 256 or not verify_password(form_data.password, admin.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return {"access_token": create_access_token(admin.email), "token_type": "bearer"}
+    return {
+        "access_token": create_access_token(admin.email, admin.role, admin.token_version),
+        "token_type": "bearer",
+    }
 
 
 def get_settings(db: Session) -> SettingsRecord:
@@ -97,16 +113,24 @@ def get_settings(db: Session) -> SettingsRecord:
     return record
 
 
-def make_store(db: Session) -> StoreSchema:
+def make_store(db: Session, admin: AdminUser) -> StoreSchema:
     config = get_settings(db)
+    permissions = set(admin.permissions)
+    is_super_admin = admin.role == "super_admin"
+    can_inventory = is_super_admin or "inventory.manage" in permissions
+    can_holds = is_super_admin or "holds.manage" in permissions
+    can_loans = is_super_admin or "loans.manage" in permissions or "portfolio.manage" in permissions
+    can_inquiries = is_super_admin or "inquiries.manage" in permissions
+    can_payouts = is_super_admin or "payouts.manage" in permissions
+    can_settings = is_super_admin or "settings.manage" in permissions
     return StoreSchema(
-        products=db.query(Product).order_by(desc(Product.created_at)).all(),
-        bids=db.query(Bid).order_by(desc(Bid.created_at)).all(),
-        loans=db.query(Loan).order_by(desc(Loan.created_at)).all(),
-        inquiries=db.query(PublicInquiry).order_by(desc(PublicInquiry.created_at)).all(),
-        referrals=db.query(Referral).order_by(desc(Referral.created_at)).all(),
-        monthly_rate=config.monthly_rate,
-        whatsapp_number=config.whatsapp_number,
+        products=db.query(Product).order_by(desc(Product.created_at)).all() if can_inventory or can_holds else [],
+        bids=db.query(Bid).order_by(desc(Bid.created_at)).all() if can_holds else [],
+        loans=db.query(Loan).order_by(desc(Loan.created_at)).all() if can_loans else [],
+        inquiries=db.query(PublicInquiry).order_by(desc(PublicInquiry.created_at)).all() if can_inquiries else [],
+        referrals=db.query(Referral).order_by(desc(Referral.created_at)).all() if can_payouts else [],
+        monthly_rate=config.monthly_rate if can_settings else None,
+        whatsapp_number=config.whatsapp_number if can_settings else "",
     )
 
 
@@ -130,9 +154,116 @@ def bootstrap(db: Session = Depends(get_db)) -> PublicStoreSchema:
     return make_public_store(db)
 
 
-@app.get("/api/admin/bootstrap", response_model=StoreSchema, dependencies=[Depends(require_admin)])
-def admin_bootstrap(db: Session = Depends(get_db)) -> StoreSchema:
-    return make_store(db)
+@app.get("/api/admin/me", response_model=AdminMeSchema)
+def admin_me(admin: AdminUser = Depends(require_admin)) -> AdminUser:
+    return admin
+
+
+@app.post("/api/admin/me/password")
+def change_admin_password(
+    payload: AdminPasswordChangeRequest,
+    db: Session = Depends(get_db),
+    admin: AdminUser = Depends(require_admin),
+) -> dict[str, str]:
+    if not verify_password(payload.current_password, admin.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+
+    admin.hashed_password = get_password_hash(payload.new_password)
+    admin.token_version += 1
+    record_admin_event(
+        db,
+        actor_email=admin.email,
+        action="admin_password_changed",
+        target_admin_email=admin.email,
+        details={"sessions_revoked": True},
+    )
+    db.commit()
+    return {
+        "access_token": create_access_token(admin.email, admin.role, admin.token_version),
+        "token_type": "bearer",
+    }
+
+
+@app.get("/api/admin/bootstrap", response_model=StoreSchema)
+def admin_bootstrap(
+    db: Session = Depends(get_db),
+    admin: AdminUser = Depends(require_permission("dashboard.read")),
+) -> StoreSchema:
+    return make_store(db, admin)
+
+
+@app.get("/api/admin/users", response_model=list[AdminUserSchema])
+def list_admin_users(
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_super_admin),
+) -> list[AdminUser]:
+    return db.query(AdminUser).order_by(AdminUser.id.asc()).all()
+
+
+@app.post("/api/admin/users", response_model=AdminUserSchema, status_code=status.HTTP_201_CREATED)
+def create_admin_user(
+    payload: AdminCreateRequest,
+    db: Session = Depends(get_db),
+    actor: AdminUser = Depends(require_super_admin),
+) -> AdminUser:
+    if db.query(AdminUser).filter(AdminUser.email == payload.email).first() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An administrator with this email already exists")
+
+    account = AdminUser(
+        email=payload.email,
+        hashed_password=get_password_hash(payload.password),
+        role="admin",
+        permissions=payload.permissions,
+    )
+    db.add(account)
+    record_admin_event(
+        db,
+        actor_email=actor.email,
+        action="admin_created",
+        target_admin_email=account.email,
+        details={"permissions": payload.permissions},
+    )
+    db.commit()
+    db.refresh(account)
+    return account
+
+
+@app.put("/api/admin/users/{admin_id}/permissions", response_model=AdminUserSchema)
+def update_admin_permissions(
+    admin_id: int,
+    payload: AdminPermissionUpdateRequest,
+    db: Session = Depends(get_db),
+    actor: AdminUser = Depends(require_super_admin),
+) -> AdminUser:
+    account = db.get(AdminUser, admin_id)
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Administrator not found")
+    if account.role == "super_admin":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The genesis super-admin permissions cannot be changed")
+
+    previous_permissions = sorted(set(account.permissions))
+    account.permissions = sorted(set(payload.permissions))
+    record_admin_event(
+        db,
+        actor_email=actor.email,
+        action="admin_permissions_updated",
+        target_admin_email=account.email,
+        details={"before": previous_permissions, "after": account.permissions},
+    )
+    db.commit()
+    db.refresh(account)
+    return account
+
+
+@app.get("/api/admin/audit-log", response_model=list[AdminAuditSchema])
+def admin_audit_log(
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_super_admin),
+) -> list[AdminAuditLog]:
+    return db.query(AdminAuditLog).order_by(desc(AdminAuditLog.id)).limit(100).all()
 
 
 @app.get("/api/referrals/{referral_code}", response_model=list[ReferralSchema])
@@ -256,7 +387,7 @@ def create_public_inquiry(
 
 @app.patch(
     "/api/admin/inquiries/{inquiry_id}",
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_permission("inquiries.manage"))],
     response_model=InquirySchema,
 )
 def update_inquiry_status(
@@ -273,14 +404,14 @@ def update_inquiry_status(
     return inquiry
 
 
-@app.get("/api/admin/bids/{product_id}", response_model=list[BidSchema], dependencies=[Depends(require_admin)])
+@app.get("/api/admin/bids/{product_id}", response_model=list[BidSchema], dependencies=[Depends(require_permission("holds.manage"))])
 def get_product_bids(product_id: str, db: Session = Depends(get_db)) -> list[Bid]:
     if db.get(Product, product_id) is None:
         raise HTTPException(status_code=404, detail="Product not found")
     return db.query(Bid).filter(Bid.product_id == product_id).order_by(desc(Bid.amount)).all()
 
 
-@app.patch("/api/admin/bids/{bid_id}/resolve", dependencies=[Depends(require_admin)])
+@app.patch("/api/admin/bids/{bid_id}/resolve", dependencies=[Depends(require_permission("holds.manage"))])
 def resolve_bid(
     bid_id: str,
     payload: BidResolveRequest,
@@ -312,7 +443,7 @@ def resolve_bid(
     return {"message": f"Bid {payload.action}ed successfully", "bidId": bid.id}
 
 
-@app.patch("/api/admin/products/{product_id}/sell", dependencies=[Depends(require_admin)])
+@app.patch("/api/admin/products/{product_id}/sell", dependencies=[Depends(require_permission("inventory.manage"))])
 def sell_product(
     product_id: str,
     payload: SellProductRequest | None = None,
@@ -347,7 +478,7 @@ def sell_product(
     return {"message": "Product marked sold", "productId": product.id}
 
 
-@app.patch("/api/admin/loans/{loan_id}", dependencies=[Depends(require_admin)])
+@app.patch("/api/admin/loans/{loan_id}", dependencies=[Depends(require_permission("loans.manage"))])
 def update_loan(
     loan_id: str,
     payload: LoanStatusRequest,
@@ -404,7 +535,7 @@ def update_loan(
     return {"message": "Loan status updated", "loanId": loan.id}
 
 
-@app.post("/api/admin/products", response_model=ProductSchema, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
+@app.post("/api/admin/products", response_model=ProductSchema, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_permission("inventory.manage"))])
 def create_product(payload: ProductSchema, db: Session = Depends(get_db)) -> Product:
     if db.get(Product, payload.id):
         raise HTTPException(status_code=409, detail="Product ID already exists")
@@ -418,7 +549,7 @@ def create_product(payload: ProductSchema, db: Session = Depends(get_db)) -> Pro
 @app.put(
     "/api/admin/products/{product_id}",
     response_model=ProductSchema,
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_permission("inventory.manage"))],
 )
 def update_product(
     product_id: str,
@@ -436,7 +567,7 @@ def update_product(
     return product
 
 
-@app.put("/api/admin/settings", dependencies=[Depends(require_admin)])
+@app.put("/api/admin/settings", dependencies=[Depends(require_permission("settings.manage"))])
 def update_settings(payload: SettingsRequest, db: Session = Depends(get_db)) -> dict[str, object]:
     record = get_settings(db)
     record.monthly_rate = payload.monthly_rate
@@ -445,7 +576,7 @@ def update_settings(payload: SettingsRequest, db: Session = Depends(get_db)) -> 
     return {"monthlyRate": record.monthly_rate, "whatsappNumber": record.whatsapp_number}
 
 
-@app.patch("/api/admin/referrals/{referral_id}/pay", response_model=ReferralSchema, dependencies=[Depends(require_admin)])
+@app.patch("/api/admin/referrals/{referral_id}/pay", response_model=ReferralSchema, dependencies=[Depends(require_permission("payouts.manage"))])
 def pay_referral(referral_id: str, db: Session = Depends(get_db)) -> Referral:
     referral = db.get(Referral, referral_id)
     if referral is None:
@@ -458,8 +589,11 @@ def pay_referral(referral_id: str, db: Session = Depends(get_db)) -> Referral:
     return referral
 
 
-@app.post("/api/admin/reset-demo", dependencies=[Depends(require_admin)])
-def reset_demo(db: Session = Depends(get_db)) -> StoreSchema:
+@app.post("/api/admin/reset-demo")
+def reset_demo(
+    db: Session = Depends(get_db),
+    admin: AdminUser = Depends(require_super_admin),
+) -> StoreSchema:
     if db.query(PortfolioLoan.id).first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -470,4 +604,4 @@ def reset_demo(db: Session = Depends(get_db)) -> StoreSchema:
     db.query(SettingsRecord).delete()
     db.commit()
     seed_database(db)
-    return make_store(db)
+    return make_store(db, admin)

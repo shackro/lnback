@@ -15,6 +15,21 @@ class AdminUser(Base):
     email: Mapped[str] = mapped_column(String(254), nullable=False, unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String(512), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="admin")
+    permissions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    token_version: Mapped[int] = mapped_column(nullable=False, default=0)
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    actor_email: Mapped[str] = mapped_column(String(254), nullable=False)
+    action: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    target_admin_email: Mapped[str] = mapped_column(String(254), nullable=False)
+    details: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class Product(Base):

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.config import settings
+from app.core.dependencies import ADMIN_PERMISSIONS
 from app.core.security import get_password_hash
 from app.db.session import get_db
 from app.main import app
@@ -30,7 +31,8 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]
             AdminUser(
                 email="admin@example.test",
                 hashed_password=get_password_hash("correct horse battery staple"),
-                role="admin",
+                role="super_admin",
+                permissions=sorted(ADMIN_PERMISSIONS),
             )
         )
         db.commit()
@@ -181,8 +183,7 @@ def test_public_inquiries_require_contact_consent_and_valid_phone(client: TestCl
     assert client.post("/api/inquiries", json=payload).status_code == 422
 
 
-def test_portfolio_offer_uses_admin_configured_terms(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "portfolio_admin_emails", "admin@example.test,second@example.test")
+def test_portfolio_offer_uses_admin_configured_terms(client: TestClient) -> None:
     application = client.post(
         "/api/loans",
         json={
@@ -253,27 +254,147 @@ def test_portfolio_offer_uses_admin_configured_terms(client: TestClient, monkeyp
     assert changed_offer.status_code == 409
 
 
-def test_portfolio_requires_exactly_two_configured_admins(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "portfolio_admin_emails", "admin@example.test")
+def test_admin_creation_scopes_api_access_and_audits_permission_changes(client: TestClient) -> None:
+    created = client.post(
+        "/api/admin/users",
+        json={
+            "email": "  clerk@example.test ",
+            "password": "a different secure password",
+            "permissions": ["dashboard.read", "inquiries.manage"],
+        },
+    )
+    assert created.status_code == 201
+    account = created.json()
+    assert account["email"] == "clerk@example.test"
+    assert account["role"] == "admin"
+    assert account["permissions"] == ["dashboard.read", "inquiries.manage"]
+    assert "hashedPassword" not in account
 
-    response = client.get("/api/admin/portfolio/loans")
+    login = client.post(
+        "/api/auth/login",
+        data={"username": "clerk@example.test", "password": "a different secure password"},
+    )
+    assert login.status_code == 200
+    delegated_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
 
-    assert response.status_code == 503
+    identity = client.get("/api/admin/me", headers=delegated_headers)
+    assert identity.status_code == 200
+    assert identity.json()["role"] == "admin"
+    assert identity.json()["permissions"] == ["dashboard.read", "inquiries.manage"]
+    store = client.get("/api/admin/bootstrap", headers=delegated_headers)
+    assert store.status_code == 200
+    assert store.json()["products"] == []
+    assert store.json()["loans"] == []
+    assert client.get("/api/admin/portfolio/loans", headers=delegated_headers).status_code == 403
+    assert client.get("/api/admin/users", headers=delegated_headers).status_code == 403
+    assert client.post(
+        "/api/admin/users",
+        json={
+            "email": "escalation@example.test",
+            "password": "another secure password",
+            "permissions": ["dashboard.read"],
+        },
+        headers=delegated_headers,
+    ).status_code == 403
+    assert client.put(
+        "/api/admin/settings",
+        json={"monthlyRate": 10, "whatsappNumber": "0712345678"},
+        headers=delegated_headers,
+    ).status_code == 403
+
+    updated = client.put(
+        f"/api/admin/users/{account['id']}/permissions",
+        json={"permissions": ["dashboard.read", "settings.manage"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["permissions"] == ["dashboard.read", "settings.manage"]
+    allowed_settings = client.put(
+        "/api/admin/settings",
+        json={"monthlyRate": 10, "whatsappNumber": "254712345678"},
+        headers=delegated_headers,
+    )
+    assert allowed_settings.status_code == 200
+    assert client.get("/api/admin/portfolio/loans", headers=delegated_headers).status_code == 403
+    audit = client.get("/api/admin/audit-log")
+    assert audit.status_code == 200
+    actions = [event["action"] for event in audit.json()]
+    assert "admin_created" in actions
+    assert "admin_permissions_updated" in actions
+    assert client.put(
+        "/api/admin/users/1/permissions",
+        json={"permissions": ["dashboard.read"]},
+    ).status_code == 409
 
 
-def test_portfolio_rejects_admin_not_in_allowlist(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "portfolio_admin_emails", "first@example.test,second@example.test")
+def test_admin_management_rejects_escalation_and_requires_super_admin(client: TestClient) -> None:
+    invalid_permissions = client.post(
+        "/api/admin/users",
+        json={
+            "email": "staff@example.test",
+            "password": "another secure password",
+            "permissions": ["inventory.manage"],
+        },
+    )
+    assert invalid_permissions.status_code == 422
 
-    response = client.get("/api/admin/portfolio/loans")
-
+    created = client.post(
+        "/api/admin/users",
+        json={
+            "email": "staff@example.test",
+            "password": "another secure password",
+            "permissions": ["dashboard.read"],
+        },
+    )
+    token = client.post(
+        "/api/auth/login",
+        data={"username": "staff@example.test", "password": "another secure password"},
+    ).json()["access_token"]
+    response = client.get("/api/admin/audit-log", headers={"Authorization": f"Bearer {token}"})
+    assert created.status_code == 201
     assert response.status_code == 403
+
+
+def test_admin_password_change_revokes_existing_sessions(client: TestClient) -> None:
+    created = client.post(
+        "/api/admin/users",
+        json={
+            "email": "secure-staff@example.test",
+            "password": "initial secure password",
+            "permissions": ["dashboard.read"],
+        },
+    )
+    assert created.status_code == 201
+    old_token = client.post(
+        "/api/auth/login",
+        data={"username": "secure-staff@example.test", "password": "initial secure password"},
+    ).json()["access_token"]
+    old_headers = {"Authorization": f"Bearer {old_token}"}
+
+    changed = client.post(
+        "/api/admin/me/password",
+        json={
+            "currentPassword": "initial secure password",
+            "newPassword": "replacement secure password",
+        },
+        headers=old_headers,
+    )
+    assert changed.status_code == 200
+    new_token = changed.json()["access_token"]
+    assert client.get("/api/admin/me", headers=old_headers).status_code == 401
+    assert client.get("/api/admin/me", headers={"Authorization": f"Bearer {new_token}"}).status_code == 200
+    assert client.post(
+        "/api/auth/login",
+        data={"username": "secure-staff@example.test", "password": "initial secure password"},
+    ).status_code == 401
+    assert client.post(
+        "/api/auth/login",
+        data={"username": "secure-staff@example.test", "password": "replacement secure password"},
+    ).status_code == 200
 
 
 def test_portfolio_tracks_savings_interest_extensions_coupons_and_payoff(
     client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "portfolio_admin_emails", "admin@example.test,second@example.test")
     client.post(
         "/api/loans",
         json={
@@ -365,7 +486,6 @@ def test_scheduled_sweep_queues_one_day_reminder_idempotently(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "portfolio_admin_emails", "admin@example.test,second@example.test")
     monkeypatch.setattr(settings, "cron_secret", "test-cron-secret-that-is-at-least-32-bytes")
     client.post(
         "/api/loans",
@@ -707,9 +827,7 @@ def test_direct_sale_rejects_invalid_partner_referral_code(client: TestClient) -
 
 def test_disbursed_referred_loan_creates_single_commission(
     client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "portfolio_admin_emails", "admin@example.test,second@example.test")
     application = client.post(
         "/api/loans",
         json={
