@@ -29,6 +29,16 @@ def ensure_product_media_columns(bind: Engine) -> None:
             connection.execute(text("ALTER TABLE products ADD COLUMN inspection_video_url VARCHAR(2048)"))
 
 
+def ensure_portfolio_audit_columns(bind: Engine) -> None:
+    columns = {column["name"] for column in inspect(bind).get_columns("portfolio_loans")}
+    if "offered_by" in columns:
+        return
+    with bind.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE portfolio_loans ADD COLUMN offered_by VARCHAR(254) NOT NULL DEFAULT 'legacy'")
+        )
+
+
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:

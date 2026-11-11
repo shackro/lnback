@@ -1,6 +1,6 @@
 from sqlalchemy import create_engine, inspect, text
 
-from app.db.session import ensure_product_media_columns
+from app.db.session import ensure_portfolio_audit_columns, ensure_product_media_columns
 
 
 def test_product_media_migration_adds_columns_to_existing_database() -> None:
@@ -18,4 +18,27 @@ def test_product_media_migration_adds_columns_to_existing_database() -> None:
         assert connection.execute(
             text("SELECT images, inspection_video_url FROM products WHERE id = 'legacy-product'")
         ).one() == ("[]", None)
+    test_engine.dispose()
+
+
+def test_portfolio_audit_migration_adds_legacy_actor_to_existing_loans() -> None:
+    test_engine = create_engine("sqlite://")
+    with test_engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE portfolio_loans "
+                "(id VARCHAR(40) PRIMARY KEY, principal NUMERIC(12, 2) NOT NULL)"
+            )
+        )
+        connection.execute(
+            text("INSERT INTO portfolio_loans (id, principal) VALUES ('legacy-loan', 3000.00)")
+        )
+
+    ensure_portfolio_audit_columns(test_engine)
+    ensure_portfolio_audit_columns(test_engine)
+
+    with test_engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT offered_by FROM portfolio_loans WHERE id = 'legacy-loan'")
+        ).scalar_one() == "legacy"
     test_engine.dispose()

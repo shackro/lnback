@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
@@ -194,10 +195,93 @@ class LoanCreateRequest(ApiModel):
         return normalize_kenyan_phone(value)
 
 
+class InquiryContactRequest(ApiModel):
+    contact_name: str = Field(min_length=1, max_length=100)
+    phone: str
+    consent: Literal[True]
+
+    @field_validator("contact_name")
+    @classmethod
+    def strip_contact_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Enter your name")
+        return cleaned
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str) -> str:
+        return normalize_kenyan_phone(value)
+
+
+class AssetFinanceInquiryRequest(InquiryContactRequest):
+    kind: Literal["asset_finance"]
+    asset_category: str = Field(min_length=1, max_length=80)
+    asset_details: dict[str, str] = Field(default_factory=dict, max_length=8)
+    condition_grade: Literal["A", "B", "C"]
+    condition_notes: str = Field(default="", max_length=1000)
+    estimated_amount: float | None = Field(default=None, gt=0, le=100_000_000)
+    preferred_inspection_time: str = Field(default="", max_length=120)
+    referral_code: str | None = Field(default=None, max_length=30)
+
+    @field_validator("asset_category")
+    @classmethod
+    def strip_asset_category(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Enter an asset category")
+        return cleaned
+
+    @field_validator("condition_notes", "preferred_inspection_time")
+    @classmethod
+    def strip_optional_inquiry_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("asset_details")
+    @classmethod
+    def validate_asset_details(cls, value: dict[str, str]) -> dict[str, str]:
+        cleaned: dict[str, str] = {}
+        for key, detail in value.items():
+            clean_key = key.strip()
+            clean_detail = detail.strip()
+            if not clean_key or len(clean_key) > 40 or len(clean_detail) > 160:
+                raise ValueError("Asset details must have short labels and values")
+            if clean_detail:
+                cleaned[clean_key] = clean_detail
+        return cleaned
+
+
+class ProductInquiryRequest(InquiryContactRequest):
+    kind: Literal["product"]
+    product_id: str = Field(min_length=1, max_length=40)
+    referral_code: str | None = Field(default=None, max_length=30)
+
+    @field_validator("product_id")
+    @classmethod
+    def strip_product_id(cls, value: str) -> str:
+        return value.strip()
+
+
+class InquirySchema(ApiModel):
+    id: str
+    kind: Literal["asset_finance", "product"]
+    contact_name: str
+    phone: str
+    context: dict[str, object]
+    status: Literal["new", "contacted", "closed"]
+    consented_at: datetime
+    created_at: datetime
+
+
+class InquiryStatusRequest(ApiModel):
+    status: Literal["new", "contacted", "closed"]
+
+
 class StoreSchema(ApiModel):
     products: list[ProductSchema]
     bids: list[BidSchema]
     loans: list[LoanSchema]
+    inquiries: list[InquirySchema]
     referrals: list[ReferralSchema]
     monthly_rate: float | None
     whatsapp_number: str
@@ -223,3 +307,95 @@ class SettingsRequest(ApiModel):
     @classmethod
     def validate_whatsapp_number(cls, value: str) -> str:
         return normalize_kenyan_phone(value)
+
+
+class PortfolioOfferRequest(ApiModel):
+    principal: Decimal = Field(ge=Decimal("1000.00"), max_digits=12, decimal_places=2)
+    interest_rate_percent: Decimal = Field(ge=Decimal("0"), le=Decimal("100"), max_digits=7, decimal_places=4)
+    term_days: int = Field(default=14, ge=1, le=365)
+    max_extensions: int = Field(default=1, ge=0, le=24)
+    buyout_window_days: int = Field(default=7, ge=1, le=60)
+
+
+class PortfolioAcceptanceRequest(ApiModel):
+    inspection_confirmed: Literal[True]
+    borrower_accepted: Literal[True]
+
+
+class PortfolioSaleAssessmentRequest(ApiModel):
+    assessed_sale_price: Decimal = Field(gt=Decimal("0"), max_digits=12, decimal_places=2)
+
+
+class PortfolioReceiptRequest(ApiModel):
+    amount: Decimal = Field(gt=Decimal("0"), max_digits=12, decimal_places=2)
+    provider_reference: str = Field(min_length=1, max_length=80)
+
+
+class PortfolioCapitalInjectionRequest(PortfolioReceiptRequest):
+    note: str | None = Field(default=None, max_length=500)
+
+
+class PortfolioExtensionRequest(ApiModel):
+    source: Literal["mpesa", "savings"]
+    amount: Decimal | None = Field(default=None, gt=Decimal("0"), max_digits=12, decimal_places=2)
+    provider_reference: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class PortfolioSettlementRequest(ApiModel):
+    amount: Decimal = Field(ge=Decimal("0"), max_digits=12, decimal_places=2)
+    apply_savings: bool = False
+    coupon_code: str | None = Field(default=None, min_length=1, max_length=40)
+    provider_reference: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class PortfolioCouponRequest(ApiModel):
+    code: str = Field(min_length=3, max_length=40, pattern=r"^[A-Za-z0-9_-]+$")
+    discount_type: Literal["fixed", "percent"]
+    discount_value: Decimal = Field(gt=Decimal("0"), max_digits=12, decimal_places=2)
+    max_redemptions: int | None = Field(default=1, ge=1, le=10000)
+    expires_at: datetime | None = None
+
+    @field_validator("discount_value")
+    @classmethod
+    def validate_percent_discount(cls, value: Decimal, info: ValidationInfo) -> Decimal:
+        if info.data.get("discount_type") == "percent" and value > Decimal("100"):
+            raise ValueError("Percentage coupons cannot exceed 100%")
+        return value
+
+
+class PortfolioCollateralSaleRequest(ApiModel):
+    amount: Decimal = Field(gt=Decimal("0"), max_digits=12, decimal_places=2)
+    provider_reference: str = Field(min_length=1, max_length=80)
+
+
+class PortfolioDisbursementConfirmationRequest(ApiModel):
+    provider_reference: str = Field(min_length=1, max_length=80)
+
+
+class PortfolioQuoteResponse(ApiModel):
+    portfolio_loan_id: str
+    status: str
+    principal: Decimal
+    outstanding_principal: Decimal
+    interest_rate_percent: Decimal
+    term_days: int
+    period_interest_due: Decimal
+    full_payoff_before_savings_or_coupon: Decimal
+    savings_balance: Decimal
+    extensions_remaining: int
+    assessed_sale_price: Decimal | None
+    buyout_price_before_savings: Decimal | None
+    maturity_at: datetime | None
+    coupon_discount: Decimal = Decimal("0.00")
+    payoff_after_savings_and_coupon: Decimal | None = None
+
+
+class PortfolioAdminLoanResponse(PortfolioQuoteResponse):
+    application_id: str
+    borrower_name: str
+    borrower_phone: str
+    collateral: str
+    max_extensions: int
+    buyout_window_days: int
+    inspection_confirmed_at: datetime | None
+    borrower_accepted_at: datetime | None

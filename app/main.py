@@ -1,21 +1,34 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Annotated
 from uuid import uuid4
 
-import jwt
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import Field
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.dependencies import require_admin
 from app.core.security import create_access_token, require_secret_key, verify_password
-from app.db.session import SessionLocal, engine, ensure_product_media_columns, get_db
-from app.models import AdminUser, Base, Bid, Loan, Product, Referral, SettingsRecord
+from app.db.session import (
+    SessionLocal,
+    engine,
+    ensure_portfolio_audit_columns,
+    ensure_product_media_columns,
+    get_db,
+)
+from app.models import AdminUser, Base, Bid, Loan, PortfolioLoan, Product, PublicInquiry, Referral, SettingsRecord
+from app.routers.portfolio import router as portfolio_router, system_router as portfolio_system_router
 from app.schemas import (
     BidResolveRequest,
     BidCreateRequest,
     BidSchema,
+    AssetFinanceInquiryRequest,
+    InquirySchema,
+    InquiryStatusRequest,
     LoanCreateRequest,
     LoanSchema,
     LoanStatusRequest,
@@ -23,6 +36,7 @@ from app.schemas import (
     ProductUpdateRequest,
     PublicBidSchema,
     PublicStoreSchema,
+    ProductInquiryRequest,
     ReferralSchema,
     SettingsRequest,
     SellProductRequest,
@@ -35,6 +49,7 @@ from app.seed import seed_database
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_product_media_columns(engine)
+    ensure_portfolio_audit_columns(engine)
     with SessionLocal() as db:
         seed_database(db)
     yield
@@ -46,6 +61,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.include_router(portfolio_router)
+app.include_router(portfolio_system_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
@@ -53,37 +70,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-
-
-def require_admin(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> AdminUser:
-    secret_key = require_secret_key()
-    try:
-        payload = jwt.decode(token, secret_key, algorithms=["HS256"])
-    except jwt.InvalidTokenError as error:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate admin credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from error
-
-    email = payload.get("sub")
-    if payload.get("role") != "admin" or not isinstance(email, str):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate admin credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    admin = db.query(AdminUser).filter(AdminUser.email == email, AdminUser.role == "admin").first()
-    if admin is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate admin credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return admin
-
 
 @app.post("/api/auth/login")
 def admin_login(
@@ -117,6 +103,7 @@ def make_store(db: Session) -> StoreSchema:
         products=db.query(Product).order_by(desc(Product.created_at)).all(),
         bids=db.query(Bid).order_by(desc(Bid.created_at)).all(),
         loans=db.query(Loan).order_by(desc(Loan.created_at)).all(),
+        inquiries=db.query(PublicInquiry).order_by(desc(PublicInquiry.created_at)).all(),
         referrals=db.query(Referral).order_by(desc(Referral.created_at)).all(),
         monthly_rate=config.monthly_rate,
         whatsapp_number=config.whatsapp_number,
@@ -220,6 +207,72 @@ def create_loan(payload: LoanCreateRequest, db: Session = Depends(get_db)) -> Lo
     return loan
 
 
+@app.post("/api/inquiries", response_model=InquirySchema, status_code=status.HTTP_201_CREATED)
+def create_public_inquiry(
+    payload: Annotated[
+        AssetFinanceInquiryRequest | ProductInquiryRequest,
+        Field(discriminator="kind"),
+    ],
+    db: Session = Depends(get_db),
+) -> PublicInquiry:
+    if isinstance(payload, AssetFinanceInquiryRequest):
+        context: dict[str, object] = {
+            "assetCategory": payload.asset_category,
+            "assetDetails": payload.asset_details,
+            "conditionGrade": payload.condition_grade,
+            "conditionNotes": payload.condition_notes,
+            "estimatedAmount": payload.estimated_amount,
+            "preferredInspectionTime": payload.preferred_inspection_time,
+            "referralCode": payload.referral_code,
+        }
+    else:
+        product = db.get(Product, payload.product_id)
+        if product is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        context = {
+            "productId": product.id,
+            "title": product.title,
+            "category": product.category,
+            "price": product.price,
+            "location": product.location,
+            "productStatus": product.status,
+            "referralCode": payload.referral_code,
+        }
+
+    inquiry = PublicInquiry(
+        id=f"REQ-{uuid4().hex[:10].upper()}",
+        kind=payload.kind,
+        contact_name=payload.contact_name,
+        phone=payload.phone,
+        context=context,
+        status="new",
+        consented_at=datetime.now(timezone.utc),
+    )
+    db.add(inquiry)
+    db.commit()
+    db.refresh(inquiry)
+    return inquiry
+
+
+@app.patch(
+    "/api/admin/inquiries/{inquiry_id}",
+    dependencies=[Depends(require_admin)],
+    response_model=InquirySchema,
+)
+def update_inquiry_status(
+    inquiry_id: str,
+    payload: InquiryStatusRequest,
+    db: Session = Depends(get_db),
+) -> PublicInquiry:
+    inquiry = db.get(PublicInquiry, inquiry_id)
+    if inquiry is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Inquiry not found")
+    inquiry.status = payload.status
+    db.commit()
+    db.refresh(inquiry)
+    return inquiry
+
+
 @app.get("/api/admin/bids/{product_id}", response_model=list[BidSchema], dependencies=[Depends(require_admin)])
 def get_product_bids(product_id: str, db: Session = Depends(get_db)) -> list[Bid]:
     if db.get(Product, product_id) is None:
@@ -303,6 +356,24 @@ def update_loan(
     loan = db.query(Loan).filter(Loan.id == loan_id).with_for_update().first()
     if loan is None:
         raise HTTPException(status_code=404, detail="Loan not found")
+    if payload.status in {"disbursed", "settled"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Use the lending portfolio payment workflow to disburse or settle a loan",
+        )
+    portfolio_loan = (
+        db.query(PortfolioLoan)
+        .filter(PortfolioLoan.application_id == loan.id)
+        .with_for_update()
+        .first()
+    )
+    if payload.status == "declined" and portfolio_loan is not None:
+        if portfolio_loan.status != "offer":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An accepted or funded portfolio account cannot be declined",
+            )
+        portfolio_loan.status = "cancelled"
     allowed = {
         "submitted": {"reviewing", "declined"},
         "reviewing": {"approved", "declined"},
@@ -389,6 +460,11 @@ def pay_referral(referral_id: str, db: Session = Depends(get_db)) -> Referral:
 
 @app.post("/api/admin/reset-demo", dependencies=[Depends(require_admin)])
 def reset_demo(db: Session = Depends(get_db)) -> StoreSchema:
+    if db.query(PortfolioLoan.id).first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Demo reset is disabled while funded portfolio accounts exist",
+        )
     for model in (Referral, Bid, Loan, Product):
         db.query(model).delete()
     db.query(SettingsRecord).delete()

@@ -78,6 +78,23 @@ class Loan(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class PublicInquiry(Base):
+    __tablename__ = "public_inquiries"
+    __table_args__ = (
+        CheckConstraint("kind IN ('asset_finance', 'product')", name="ck_public_inquiries_kind"),
+        CheckConstraint("status IN ('new', 'contacted', 'closed')", name="ck_public_inquiries_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    contact_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    phone: Mapped[str] = mapped_column(String(15), nullable=False, index=True)
+    context: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="new", index=True)
+    consented_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class Referral(Base):
     __tablename__ = "referrals"
     __table_args__ = (UniqueConstraint("kind", "reference_id", name="uq_referrals_kind_reference"),)
